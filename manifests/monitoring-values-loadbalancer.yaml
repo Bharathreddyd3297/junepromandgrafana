@@ -1,0 +1,19 @@
+# Optional overlay: expose Grafana, Prometheus and Alertmanager on Azure
+# public load balancers. Applied by scripts/05-expose-loadbalancer.*
+# Prometheus and Alertmanager have NO login, so the script restricts access
+# to your own public IP with loadBalancerSourceRanges.
+
+grafana:
+  service:
+    type: LoadBalancer
+    port: 80
+
+prometheus:
+  service:
+    type: LoadBalancer
+    port: 9090
+
+alertmanager:
+  service:
+    type: LoadBalancer
+    port: 9093

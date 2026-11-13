@@ -1,0 +1,209 @@
+# Custom Prometheus rules for the lab.
+# The Prometheus Operator turns this PrometheusRule object into rule files
+# and reloads Prometheus automatically - no restart needed.
+#
+# "for:" durations are deliberately short (1m) so alerts fire during a live demo.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: demo-lab-rules
+  namespace: demo
+  labels:
+    app: podinfo
+    release: monitoring
+spec:
+  groups:
+    # ------------------------------------------------------------------
+    # Recording rules: pre-compute expensive queries into new, cheap series.
+    # ------------------------------------------------------------------
+    - name: demo.recording
+      interval: 15s
+      rules:
+        - record: demo:http_requests:rate1m
+          expr: |
+            sum by (namespace, job) (
+              rate(http_request_duration_seconds_count{namespace="demo", job="podinfo", path!~"/metrics|/healthz|/readyz"}[1m])
+            )
+        - record: demo:http_errors:ratio_rate1m
+          expr: |
+            sum by (namespace, job) (
+              rate(http_request_duration_seconds_count{namespace="demo", job="podinfo", status=~"5.."}[1m])
+            )
+            /
+            sum by (namespace, job) (
+              rate(http_request_duration_seconds_count{namespace="demo", job="podinfo"}[1m])
+            )
+        - record: demo:http_request_duration_seconds:p95_1m
+          expr: |
+            histogram_quantile(0.95,
+              sum by (namespace, job, le) (
+                rate(http_request_duration_seconds_bucket{namespace="demo", job="podinfo", path!~"/metrics|/healthz|/readyz"}[1m])
+              )
+            )
+        - record: demo:container_cpu_limit_utilisation:ratio
+          expr: |
+            sum by (namespace, pod, container) (
+              rate(container_cpu_usage_seconds_total{namespace="demo", container!="", image!=""}[2m])
+            )
+            /
+            sum by (namespace, pod, container) (
+              kube_pod_container_resource_limits{namespace="demo", resource="cpu"}
+            )
+        - record: demo:container_memory_limit_utilisation:ratio
+          expr: |
+            sum by (namespace, pod, container) (
+              container_memory_working_set_bytes{namespace="demo", container!="", image!=""}
+            )
+            /
+            sum by (namespace, pod, container) (
+              kube_pod_container_resource_limits{namespace="demo", resource="memory"}
+            )
+
+    # ------------------------------------------------------------------
+    # Application alerts (RED: Rate, Errors, Duration).
+    # ------------------------------------------------------------------
+    - name: demo.app.alerts
+      rules:
+        - alert: PodinfoHighErrorRate
+          expr: demo:http_errors:ratio_rate1m > 0.05
+          for: 1m
+          labels:
+            severity: critical
+            team: demo
+          annotations:
+            summary: "podinfo is returning too many HTTP 5xx errors"
+            description: "{{ $value | humanizePercentage }} of requests to podinfo failed over the last minute (threshold 5%)."
+
+        - alert: PodinfoHighLatency
+          expr: demo:http_request_duration_seconds:p95_1m > 0.5
+          for: 1m
+          labels:
+            severity: warning
+            team: demo
+          annotations:
+            summary: "podinfo p95 latency is above 500ms"
+            description: "95th percentile request duration is {{ $value | humanizeDuration }}."
+
+        - alert: PodinfoTargetDown
+          expr: up{namespace="demo", job="podinfo"} == 0
+          for: 1m
+          labels:
+            severity: critical
+            team: demo
+          annotations:
+            summary: "Prometheus cannot scrape {{ $labels.pod }}"
+            description: "Target {{ $labels.instance }} has been down for more than 1 minute."
+
+        - alert: PodinfoNoTargets
+          expr: absent(up{namespace="demo", job="podinfo"})
+          for: 1m
+          labels:
+            severity: critical
+            team: demo
+          annotations:
+            summary: "No podinfo targets found"
+            description: "Prometheus has no podinfo targets at all. The deployment may be scaled to zero or deleted."
+
+        - alert: PodinfoReplicasMismatch
+          expr: |
+            kube_deployment_status_replicas_available{namespace="demo", deployment="podinfo"}
+              <
+            kube_deployment_spec_replicas{namespace="demo", deployment="podinfo"}
+          for: 1m
+          labels:
+            severity: warning
+            team: demo
+          annotations:
+            summary: "podinfo has fewer available replicas than desired"
+            description: "Only {{ $value }} replica(s) are available."
+
+    # ------------------------------------------------------------------
+    # Container resource alerts (USE: Utilisation, Saturation, Errors).
+    # ------------------------------------------------------------------
+    - name: demo.resources.alerts
+      rules:
+        - alert: ContainerHighCpuUsage
+          expr: demo:container_cpu_limit_utilisation:ratio > 0.8
+          for: 1m
+          labels:
+            severity: warning
+            team: demo
+          annotations:
+            summary: "{{ $labels.pod }}/{{ $labels.container }} is using more than 80% of its CPU limit"
+            description: "CPU usage is {{ $value | humanizePercentage }} of the limit."
+
+        - alert: ContainerCpuThrottling
+          expr: |
+            sum by (namespace, pod, container) (
+              rate(container_cpu_cfs_throttled_periods_total{namespace="demo", container!=""}[2m])
+            )
+            /
+            sum by (namespace, pod, container) (
+              rate(container_cpu_cfs_periods_total{namespace="demo", container!=""}[2m])
+            )
+            > 0.25
+          for: 1m
+          labels:
+            severity: warning
+            team: demo
+          annotations:
+            summary: "{{ $labels.pod }}/{{ $labels.container }} is being CPU throttled"
+            description: "{{ $value | humanizePercentage }} of CPU periods were throttled. The container wants more CPU than its limit allows."
+
+        - alert: ContainerHighMemoryUsage
+          expr: demo:container_memory_limit_utilisation:ratio > 0.8
+          for: 1m
+          labels:
+            severity: warning
+            team: demo
+          annotations:
+            summary: "{{ $labels.pod }}/{{ $labels.container }} is using more than 80% of its memory limit"
+            description: "Memory usage is {{ $value | humanizePercentage }} of the limit. The container will be OOM-killed at 100%."
+
+        - alert: ContainerOOMKilled
+          expr: |
+            (kube_pod_container_status_last_terminated_reason{namespace="demo", reason="OOMKilled"} == 1)
+            and on (namespace, pod, container)
+            (increase(kube_pod_container_status_restarts_total{namespace="demo"}[10m]) > 0)
+          labels:
+            severity: critical
+            team: demo
+          annotations:
+            summary: "{{ $labels.pod }}/{{ $labels.container }} was OOM-killed"
+            description: "The container exceeded its memory limit and was restarted in the last 10 minutes."
+
+        - alert: ContainerRestarted
+          expr: increase(kube_pod_container_status_restarts_total{namespace="demo"}[5m]) > 0
+          labels:
+            severity: warning
+            team: demo
+          annotations:
+            summary: "{{ $labels.pod }}/{{ $labels.container }} restarted"
+            description: "The container restarted in the last 5 minutes."
+
+    # ------------------------------------------------------------------
+    # Node alerts.
+    # ------------------------------------------------------------------
+    - name: demo.node.alerts
+      rules:
+        - alert: NodeHighCpuUsage
+          expr: |
+            1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[2m])) > 0.8
+          for: 2m
+          labels:
+            severity: warning
+            team: demo
+          annotations:
+            summary: "Node {{ $labels.instance }} CPU usage is above 80%"
+            description: "CPU usage is {{ $value | humanizePercentage }}."
+
+        - alert: NodeHighMemoryUsage
+          expr: |
+            1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.85
+          for: 2m
+          labels:
+            severity: warning
+            team: demo
+          annotations:
+            summary: "Node {{ $labels.instance }} memory usage is above 85%"
+            description: "Memory usage is {{ $value | humanizePercentage }}."

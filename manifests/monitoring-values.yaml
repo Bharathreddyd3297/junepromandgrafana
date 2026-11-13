@@ -1,0 +1,41 @@
+# Helm values for kube-prometheus-stack, tuned for a short AKS demo.
+# Installs: Prometheus Operator, Prometheus, Alertmanager, Grafana,
+#           node-exporter and kube-state-metrics.
+
+grafana:
+  # Lab-only password. Change it if you expose Grafana on a public IP.
+  adminUser: admin
+  adminPassword: "PromGraf-Lab-2026"
+  defaultDashboardsTimezone: browser
+
+prometheus:
+  prometheusSpec:
+    # Fast scrape/evaluation so load shows up on dashboards within seconds.
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+    retention: 6h
+    # Pick up ServiceMonitors / PodMonitors / PrometheusRules from ANY namespace,
+    # not only the ones labelled with this Helm release.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+
+# AKS runs the control plane for you, so these components cannot be scraped.
+# Disabling them avoids permanently "down" targets and false alerts.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+defaultRules:
+  rules:
+    etcd: false
+    kubeControllerManager: false
+    kubeProxy: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
